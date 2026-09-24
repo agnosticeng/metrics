@@ -78,8 +78,12 @@ static COMPONENT_SKIPPED_PATH: &[Label] = &[Label::from_static_parts("component"
 static COMPONENT_INHERITED: &[Label] = &[Label::from_static_parts("component", "analyzer")];
 static COMPONENT_RECORDED_PATH: &[Label] =
     &[Label::from_static_parts("component", "analyzer.worker")];
-static COMPONENT_RECORDED_LEAF_PATH: &[Label] =
-    &[Label::from_static_parts("component", "analyzer.worker.leaf")];
+static COMPONENT_RECORDED_REPLACED_PATH: &[Label] =
+    &[Label::from_static_parts("component", "analyzer.leaf")];
+static COMPONENT_EMPTY_METRIC: &[Label] = &[Label::from_static_parts("component", "analyzer")];
+static COMPONENT_NO_DOUBLE_COUNT: &[Label] =
+    &[Label::from_static_parts("component", "analyzer.worker")];
+static COMPONENT_LATE_PARENT_FIELD: &[Label] = &[Label::from_static_parts("component", "root")];
 static COMPONENT_METRIC_LABEL_WINS: &[Label] = &[Label::from_static_parts("component", "manual")];
 static PER_FIELD_ISOLATION: &[Label] = &[
     Label::from_static_parts("component", "outer_c.inner_c"),
@@ -944,9 +948,12 @@ fn test_field_merge_policy_record_composes() {
 
             counter!("my_counter").increment(1);
 
+            // The recorded value composes with the value inherited from the parent chain.
             span.record("component", "worker");
             counter!("my_counter").increment(1);
 
+            // A recorded value *replaces* the span's own previous contribution rather than
+            // accumulating onto it: the parent-chain value stays the outer component.
             span.record("component", "leaf");
             counter!("my_counter").increment(1);
         },
@@ -978,7 +985,7 @@ fn test_field_merge_policy_record_composes() {
             (
                 CompositeKey::new(
                     MetricKind::Counter,
-                    Key::from_static_parts(MY_COUNTER, COMPONENT_RECORDED_LEAF_PATH)
+                    Key::from_static_parts(MY_COUNTER, COMPONENT_RECORDED_REPLACED_PATH)
                 ),
                 None,
                 None,
@@ -1062,6 +1069,143 @@ fn test_field_merge_policy_per_field_isolation() {
             None,
             None,
             DebugValue::Counter(1),
+        )]
+    );
+}
+
+#[test]
+fn test_field_merge_policy_record_replaces_own_value() {
+    // The child span defines the field at creation (stored as `analyzer.worker`). Recording
+    // the field again must *replace* the child's own contribution instead of accumulating:
+    // the second record still produces `analyzer.worker`, never `analyzer.worker.worker`.
+    let snapshot = with_metrics_tracing_layer(
+        MetricsLayer::new().with_field_merge_policy("component", FieldMergePolicy::Append(".")),
+        TracingContextLayer::all(),
+        || {
+            let parent = span!(Level::TRACE, "parent", component = "analyzer");
+            let _parent_guard = parent.enter();
+
+            let span = span!(Level::TRACE, "child", component = "worker");
+            let _span_guard = span.enter();
+
+            span.record("component", "worker");
+            counter!("my_counter").increment(1);
+        },
+    );
+
+    let snapshot = snapshot.into_vec();
+
+    assert_eq!(
+        snapshot,
+        vec![(
+            CompositeKey::new(
+                MetricKind::Counter,
+                Key::from_static_parts(MY_COUNTER, COMPONENT_NO_DOUBLE_COUNT)
+            ),
+            None,
+            None,
+            DebugValue::Counter(1),
+        )]
+    );
+}
+
+#[test]
+fn test_field_merge_policy_append_empty_values() {
+    // Empty values never produce dangling separators: a child span created with an empty
+    // own value (or recording an empty value) keeps the parent-chain value as-is.
+    let snapshot = with_metrics_tracing_layer(
+        MetricsLayer::new().with_field_merge_policy("component", FieldMergePolicy::Append(".")),
+        TracingContextLayer::all(),
+        || {
+            let parent = span!(Level::TRACE, "parent", component = "analyzer");
+            let _parent_guard = parent.enter();
+
+            // Empty own value at creation: must not yield `analyzer.` (or `.analyzer`).
+            let span = span!(Level::TRACE, "child", component = "");
+            let _span_guard = span.enter();
+
+            counter!("my_counter").increment(1);
+
+            // Recording an empty value: must not yield `analyzer.` either.
+            span.record("component", "");
+            counter!("my_counter").increment(1);
+
+            // And a subsequent real value behaves as usual.
+            span.record("component", "worker");
+            counter!("my_counter").increment(1);
+        },
+    );
+
+    let snapshot = snapshot.into_vec();
+
+    // The two metrics emitted while the component value was empty collapse into a single
+    // `analyzer` key (never `analyzer.`), and the later record yields `analyzer.worker`.
+    assert_eq!(
+        snapshot,
+        vec![
+            (
+                CompositeKey::new(
+                    MetricKind::Counter,
+                    Key::from_static_parts(MY_COUNTER, COMPONENT_EMPTY_METRIC)
+                ),
+                None,
+                None,
+                DebugValue::Counter(2),
+            ),
+            (
+                CompositeKey::new(
+                    MetricKind::Counter,
+                    Key::from_static_parts(MY_COUNTER, COMPONENT_RECORDED_PATH)
+                ),
+                None,
+                None,
+                DebugValue::Counter(1),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_field_merge_policy_append_late_recorded_parent_field() {
+    // Composition sees the parent chain as it exists when the child span is created: a
+    // field that the parent records after the child was created does not flow into the
+    // child's already-composed label value.
+    let snapshot = with_metrics_tracing_layer(
+        MetricsLayer::new().with_field_merge_policy("component", FieldMergePolicy::Append(".")),
+        TracingContextLayer::all(),
+        || {
+            let root = span!(Level::TRACE, "root", component = "root");
+            let _root_guard = root.enter();
+
+            let middle = span!(Level::TRACE, "middle");
+            let _middle_guard = middle.enter();
+
+            let leaf = span!(Level::TRACE, "leaf");
+            let _leaf_guard = leaf.enter();
+
+            counter!("my_counter").increment(1);
+
+            // Recording a field on the parent after the grandchild was created changes the
+            // parent's own label, but the grandchild's composition is not revisited.
+            middle.record("component", "branch");
+            counter!("my_counter").increment(1);
+        },
+    );
+
+    let snapshot = snapshot.into_vec();
+
+    // Both metrics stay `root`: the parent's late-recorded field never flows into the
+    // grandchild's already-composed label, so the two increments collapse into one key.
+    assert_eq!(
+        snapshot,
+        vec![(
+            CompositeKey::new(
+                MetricKind::Counter,
+                Key::from_static_parts(MY_COUNTER, COMPONENT_LATE_PARENT_FIELD)
+            ),
+            None,
+            None,
+            DebugValue::Counter(2),
         )]
     );
 }

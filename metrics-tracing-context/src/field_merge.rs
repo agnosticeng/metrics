@@ -20,13 +20,21 @@ pub enum FieldMergePolicy {
     ///
     /// When a child span inherits a field from its parent, the parent's value is treated
     /// as the outer value and the child's own value as the inner one. When a value is set
-    /// via [`Span::record`][tracing::Span::record], the previously held value is treated
-    /// as the outer value and the newly recorded value as the inner one. If only one of
-    /// the two values exists, it is used as-is.
+    /// via [`Span::record`][tracing::Span::record], the value inherited from the parent
+    /// chain is treated as the outer value and the newly recorded value as the inner one:
+    /// a recorded value therefore *replaces* any value the span itself held for the field
+    /// before (from span creation or an earlier record), rather than accumulating onto it.
+    /// If only one of the two values exists, it is used as-is, and an empty value never
+    /// produces a dangling separator (e.g. `parent.`).
     ///
     /// As spans nest, values accumulate into a path: given `component = "analyzer"` on the
     /// root span, `component = "worker"` on a child span, and `component = "task"` on a
     /// grandchild span, metrics emitted within the grandchild span see
     /// `component = "analyzer.worker.task"`.
+    ///
+    /// Note that composition only sees the parent's fields as they exist at the moment the
+    /// composition happens: a field that the parent spans record *after* the child span was
+    /// created does not exist when the initial composition occurs, so it is not reflected
+    /// in the child's label value.
     Append(&'static str),
 }
